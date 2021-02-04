@@ -4,6 +4,7 @@ use std::process::Command;
 use actix::prelude::*;
 use actix_web::web::Json;
 use actix_web::{get, post, web, HttpResponse, Responder};
+use chrono::{DateTime, Utc};
 use rand::{self, rngs::ThreadRng, Rng};
 use serde::{Deserialize, Serialize};
 
@@ -11,14 +12,20 @@ use crate::config::Location;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Message)]
 #[rtype(result = "()")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Job {
     url: String,
     location: Location,
+    started_on: DateTime<Utc>,
 }
 
 impl Job {
     pub fn new(url: String, location: Location) -> Job {
-        Job { url, location }
+        Job {
+            url,
+            location,
+            started_on: Utc::now(),
+        }
     }
 }
 
@@ -39,7 +46,7 @@ impl JobServer {
     }
 
     fn broadcast(&self, msg: JobAction) {
-        for (_, session) in &self.sessions {
+        for session in self.sessions.values() {
             let _ = session.do_send(msg.clone());
         }
     }
@@ -53,20 +60,37 @@ impl JobServer {
                 .arg("-o")
                 .arg("%(title)s.mp4")
                 .arg(&job.url)
-                .status();
+                .output();
 
-            info!("finished");
+            debug!("finished");
             match res {
-                Ok(dink) => {
-                    info!("job succeeded! {:?}", dink);
-                    addr.do_send(JobAction::Finished(job.clone()));
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("job succeeded!");
+                        addr.do_send(JobAction::Finished(job.clone()));
+                    } else {
+                        let error = String::from_utf8_lossy(&output.stderr).to_string();
+                        error!("youtube-dl failed: {:?}", error);
+                        addr.do_send(JobAction::Failed {
+                            job: job.clone(),
+                            reason: error,
+                        });
+                    }
                 }
-                Err(e) => {
-                    error!("job failed: {}", e);
-                    addr.do_send(JobAction::Failed(job.clone()));
+                Err(err) => {
+                    // this is a server error
+                    error!("job startup failed: {}", err);
+                    addr.do_send(JobAction::Failed {
+                        job: job.clone(),
+                        reason: err.to_string(),
+                    });
                 }
             };
         });
+    }
+
+    fn pending_jobs(&self) -> Vec<Job> {
+        self.jobs.iter().cloned().collect()
     }
 }
 
@@ -87,9 +111,14 @@ pub struct Disconnect {
 pub(crate) enum JobAction {
     Start(Job),
     Finished(Job),
-    PendingJobs(Vec<Job>),
+    /// job was already in queue
     Rejected(Job),
-    Failed(Job),
+    /// job finished, but unsuccessfully
+    Failed {
+        job: Job,
+        reason: String,
+    },
+    PendingJobs(Vec<Job>),
 }
 
 impl Actor for JobServer {
@@ -132,15 +161,15 @@ impl Handler<JobAction> for JobServer {
                     self.broadcast(JobAction::Rejected(job));
                 }
             }
-            JobAction::Finished(job) | JobAction::Failed(job) => {
+            JobAction::Finished(job) | JobAction::Failed { job, reason: _ } => {
                 self.jobs.remove(&job);
                 self.broadcast(msg);
             }
             _ => (),
         }
 
-        let pending_jobs: Vec<Job> = self.jobs.iter().cloned().collect();
-        self.broadcast(JobAction::PendingJobs(pending_jobs.clone()));
+        let jobs = self.pending_jobs();
+        self.broadcast(JobAction::PendingJobs(jobs));
     }
 }
 
@@ -169,11 +198,17 @@ async fn create_job(
 
     job_server.send(JobAction::Start(job.clone())).await.ok();
 
-    HttpResponse::Ok().json(job)
+    HttpResponse::Accepted().json(job)
 }
 
 #[get("/jobs")]
 async fn get_jobs() -> impl Responder {
+    let jobs: Vec<Job> = Vec::new();
+    HttpResponse::Ok().json(jobs)
+}
+
+#[get("/completed-jobs")]
+async fn get_completed_jobs() -> impl Responder {
     let jobs: Vec<Job> = Vec::new();
     HttpResponse::Ok().json(jobs)
 }

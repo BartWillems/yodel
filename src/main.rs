@@ -2,6 +2,7 @@
 extern crate log;
 
 use actix::prelude::*;
+use actix_cors::Cors;
 use actix_web::middleware::Logger;
 use actix_web::{web, App, HttpServer};
 
@@ -23,6 +24,7 @@ async fn init() -> std::io::Result<()> {
         App::new()
             .data(job_server.clone())
             .wrap(Logger::default())
+            .wrap(Cors::permissive().supports_credentials())
             .service(config::get_config)
             .service(jobs::get_jobs)
             .service(jobs::create_job)
