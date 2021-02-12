@@ -25,9 +25,12 @@ async fn init() -> std::io::Result<()> {
             .data(job_server.clone())
             .wrap(Logger::default())
             .wrap(Cors::permissive().supports_credentials())
-            .service(config::get_config)
-            .service(jobs::get_jobs)
-            .service(jobs::create_job)
+            .service(
+                web::scope("/api")
+                    .service(config::get_config)
+                    .service(jobs::get_jobs)
+                    .service(jobs::create_job),
+            )
             .service(web::resource("/ws").to(websocket::route))
     })
     .bind("127.0.0.1:8080")?
