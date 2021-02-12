@@ -19,7 +19,7 @@ async fn get_config() -> impl Responder {
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Location {
+pub struct Location {
     name: String,
     path: std::path::PathBuf,
 }

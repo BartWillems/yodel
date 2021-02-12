@@ -14,7 +14,7 @@ use crate::config::Location;
 #[derive(Debug, Clone, Serialize, Message)]
 #[rtype(result = "()")]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Job {
+pub struct Job {
     url: String,
     location: Location,
     started_on: DateTime<Utc>,
@@ -122,6 +122,10 @@ pub struct Disconnect {
     pub id: usize,
 }
 
+#[derive(Message)]
+#[rtype(result = "Result<Vec<Job>, std::io::Error>")]
+pub struct PendingJobs;
+
 #[derive(Debug, Message, Serialize, Clone)]
 #[rtype(result = "()")]
 pub(crate) enum JobAction {
@@ -160,6 +164,14 @@ impl Handler<Disconnect> for JobServer {
     fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) {
         info!("connection lost");
         self.sessions.remove(&msg.id);
+    }
+}
+
+impl Handler<PendingJobs> for JobServer {
+    type Result = Result<Vec<Job>, std::io::Error>;
+
+    fn handle(&mut self, _: PendingJobs, _: &mut Context<Self>) -> Self::Result {
+        Ok(self.pending_jobs())
     }
 }
 
@@ -217,8 +229,12 @@ async fn create_job(
 }
 
 #[get("/jobs")]
-async fn get_jobs() -> impl Responder {
-    let jobs: Vec<Job> = Vec::new();
+async fn get_jobs(job_server: web::Data<actix::Addr<JobServer>>) -> impl Responder {
+    let jobs: Vec<Job> = job_server
+        .send(PendingJobs)
+        .await
+        .expect("Actix message error")
+        .expect("This should never happen");
     HttpResponse::Ok().json(jobs)
 }
 
