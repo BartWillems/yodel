@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::process::Command;
 
 use actix::prelude::*;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Location;
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Message)]
+#[derive(Debug, Clone, Serialize, Message)]
 #[rtype(result = "()")]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Job {
@@ -18,6 +19,21 @@ pub(crate) struct Job {
     location: Location,
     started_on: DateTime<Utc>,
 }
+
+impl Hash for Job {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.url.hash(state);
+        self.location.hash(state);
+    }
+}
+
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        self.url.eq(&other.url) && self.location.eq(&other.location)
+    }
+}
+
+impl Eq for Job {}
 
 impl Job {
     pub fn new(url: String, location: Location) -> Job {
@@ -157,6 +173,7 @@ impl Handler<JobAction> for JobServer {
                 if self.jobs.insert(job.clone()) {
                     self.broadcast(msg);
                     self.start_job_actix(job, _ctx.address());
+                    self.broadcast(JobAction::PendingJobs(self.pending_jobs()));
                 } else {
                     self.broadcast(JobAction::Rejected(job));
                 }
@@ -164,12 +181,10 @@ impl Handler<JobAction> for JobServer {
             JobAction::Finished(job) | JobAction::Failed { job, reason: _ } => {
                 self.jobs.remove(&job);
                 self.broadcast(msg);
+                self.broadcast(JobAction::PendingJobs(self.pending_jobs()));
             }
             _ => (),
         }
-
-        let jobs = self.pending_jobs();
-        self.broadcast(JobAction::PendingJobs(jobs));
     }
 }
 
