@@ -73,6 +73,9 @@ impl JobServer {
             let res = Command::new("youtube-dl")
                 .current_dir(job.location.path())
                 .arg("--no-overwrite")
+                .arg("--all-subs")
+                .arg("--embed-subs")
+                .arg("--embed-thumbnail")
                 .arg("-o")
                 .arg("%(title)s.mp4")
                 .arg(&job.url)
@@ -83,22 +86,19 @@ impl JobServer {
                 Ok(output) => {
                     if output.status.success() {
                         info!("job succeeded!");
-                        addr.do_send(JobAction::Finished(job.clone()));
+                        addr.do_send(JobAction::Finished(job));
                     } else {
-                        let error = String::from_utf8_lossy(&output.stderr).to_string();
-                        error!("youtube-dl failed: {:?}", error);
-                        addr.do_send(JobAction::Failed {
-                            job: job.clone(),
-                            reason: error,
-                        });
+                        let reason = String::from_utf8_lossy(&output.stderr).to_string();
+                        error!("youtube-dl failed: {:?}", reason);
+                        addr.do_send(JobAction::Failed { job, reason });
                     }
                 }
-                Err(err) => {
+                Err(reason) => {
                     // this is a server error
-                    error!("job startup failed: {}", err);
+                    error!("job startup failed: {}", reason);
                     addr.do_send(JobAction::Failed {
-                        job: job.clone(),
-                        reason: err.to_string(),
+                        job,
+                        reason: reason.to_string(),
                     });
                 }
             };
