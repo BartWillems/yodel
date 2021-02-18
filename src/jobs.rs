@@ -75,7 +75,6 @@ impl JobServer {
                 .arg("--no-overwrite")
                 .arg("--all-subs")
                 .arg("--embed-subs")
-                .arg("--embed-thumbnail")
                 .arg("-o")
                 .arg("%(title)s.mp4")
                 .arg(&job.url)
