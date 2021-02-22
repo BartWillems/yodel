@@ -38,7 +38,6 @@ async fn init() -> std::io::Result<()> {
                     .service(jobs::create_job),
             )
             .service(web::resource("/ws").to(websocket::route))
-            .service(Files::new("/", "frontend/build").index_file("index.html"))
             .service(mount_frontend())
     })
     .bind("127.0.0.1:8080")?

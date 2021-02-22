@@ -12,7 +12,7 @@ server:
 all: frontend server
 
 install:
-	cp target/yodel /opt/yodel/bin/yodel
+	cp target/release/yodel /opt/yodel/bin/yodel
 	cp -r frontend/build /opt/yodel/frontend
 
 clean:
