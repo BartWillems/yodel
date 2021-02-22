@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::process::Command;
 
@@ -10,45 +12,12 @@ use rand::{self, rngs::ThreadRng, Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Location;
-
-#[derive(Debug, Clone, Serialize, Message)]
-#[rtype(result = "()")]
-#[serde(rename_all = "camelCase")]
-pub struct Job {
-    url: String,
-    location: Location,
-    started_on: DateTime<Utc>,
-}
-
-impl Hash for Job {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.url.hash(state);
-        self.location.hash(state);
-    }
-}
-
-impl PartialEq for Job {
-    fn eq(&self, other: &Self) -> bool {
-        self.url.eq(&other.url) && self.location.eq(&other.location)
-    }
-}
-
-impl Eq for Job {}
-
-impl Job {
-    pub fn new(url: String, location: Location) -> Job {
-        Job {
-            url,
-            location,
-            started_on: Utc::now(),
-        }
-    }
-}
+use crate::errors::YodelError;
 
 #[derive(Clone)]
 pub(crate) struct JobServer {
     jobs: HashSet<Job>,
-    sessions: HashMap<usize, Recipient<JobAction>>,
+    sessions: HashMap<usize, Recipient<JobResponse>>,
     rng: ThreadRng,
 }
 
@@ -61,13 +30,14 @@ impl JobServer {
         }
     }
 
-    fn broadcast(&self, msg: JobAction) {
+    // Send a message to all connected clients
+    fn broadcast(&self, msg: JobResponse) {
         for session in self.sessions.values() {
             let _ = session.do_send(msg.clone());
         }
     }
 
-    pub(crate) fn start_job_actix(&mut self, job: Job, addr: Addr<JobServer>) {
+    pub(crate) fn start_job(&mut self, job: Job, addr: Addr<JobServer>) {
         info!("starting job");
         std::thread::spawn(move || {
             let res = Command::new("youtube-dl")
@@ -85,17 +55,17 @@ impl JobServer {
                 Ok(output) => {
                     if output.status.success() {
                         info!("job succeeded!");
-                        addr.do_send(JobAction::Finished(job));
+                        addr.do_send(JobResponse::Finished(job));
                     } else {
                         let reason = String::from_utf8_lossy(&output.stderr).to_string();
                         error!("youtube-dl failed: {:?}", reason);
-                        addr.do_send(JobAction::Failed { job, reason });
+                        addr.do_send(JobResponse::Failed { job, reason });
                     }
                 }
                 Err(reason) => {
                     // this is a server error
                     error!("job startup failed: {}", reason);
-                    addr.do_send(JobAction::Failed {
+                    addr.do_send(JobResponse::Failed {
                         job,
                         reason: reason.to_string(),
                     });
@@ -104,15 +74,171 @@ impl JobServer {
         });
     }
 
+    fn search_title(&mut self, job: Job, addr: Addr<JobServer>) {
+        std::thread::spawn(move || {
+            let res = Command::new("youtube-dl")
+            .arg("--get-title")
+            .arg(&job.url)
+            .output();
+
+        match res {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("job succeeded!");
+                            addr.do_send(VideoTitle {
+                        job,
+                        title: String::from_utf8_lossy(&output.stdout).to_string(),
+                    });
+                } else {
+                    let err = String::from_utf8_lossy(&output.stderr).to_string();
+                    error!("unable to fetch video title: {}", err);
+                }
+            }
+            Err(reason)=> {
+                error!("video title lookup failure: {}", reason);
+            }
+        }
+
+        
+        });
+    }
+
     fn pending_jobs(&self) -> Vec<Job> {
-        self.jobs.iter().cloned().collect()
+        self.jobs
+            .iter()
+            .filter(|job: &&Job| !job.finished)
+            .cloned()
+            .collect()
+    }
+
+    fn finished_jobs(&self) -> Vec<Job> {
+        self.jobs
+            .iter()
+            .filter(|job: &&Job| job.finished)
+            .cloned()
+            .collect()
+    }
+
+    // Mark a job as finished
+    fn mark_finished(&mut self, job: &Job) {
+        let mut job = self.jobs.take(job).expect("The job has to exist");
+        assert_eq!(job.finished, false);
+        job.finished = true;
+        self.jobs.insert(job);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Message)]
+#[rtype(result = "()")]
+#[serde(rename_all = "camelCase")]
+pub struct Job {
+    url: String,
+    title: Option<String>,
+    location: Location,
+    started_on: DateTime<Utc>,
+    finished: bool,
+}
+
+impl TryFrom<JobRequest> for Job {
+    type Error = YodelError;
+
+    fn try_from(request: JobRequest) -> Result<Job, Self::Error> {
+        let location = match Location::lookup(&request.location) {
+            Some(location) => location,
+            None => {
+                return Err(YodelError::BadRequest("Invalid Location".to_string()));
+            }
+        };
+
+        Ok(Job {
+            url: request.url,
+            title: None,
+            location,
+            started_on: Utc::now(),
+            finished: false,
+        })
+    }
+}
+
+impl Hash for Job {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.url.hash(state);
+        self.location.hash(state);
+    }
+}
+
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        self.url.eq(&other.url) && self.location.eq(&other.location)
+    }
+}
+
+impl Eq for Job {}
+
+impl fmt::Display for Job {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(title) = &self.title {
+            write!(f, "{}", title)
+        } else {
+            write!(f, "{}", self.url)
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Message)]
+#[rtype(result = "Result<Job, YodelError>")]
+struct JobRequest {
+    url: String,
+    location: String,
+}
+
+impl Handler<JobRequest> for JobServer {
+    type Result = Result<Job, YodelError>;
+
+    fn handle(&mut self, request: JobRequest, ctx: &mut Context<Self>) -> Self::Result {
+        debug!("Request received: {:?}", request);
+
+        let job = Job::try_from(request)?;
+
+        if self.jobs.insert(job.clone()) {
+            self.start_job(job.clone(), ctx.address());
+            self.search_title(job.clone(), ctx.address());
+            self.broadcast(JobResponse::PendingJobs(self.pending_jobs()));
+            Ok(job)
+        } else {
+            Err(YodelError::Conflict(job.to_string()))
+        }
+    }
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct VideoTitle {
+    job: Job,
+    title: String,
+}
+
+impl Handler<VideoTitle> for JobServer {
+    type Result = ();
+
+    fn handle(&mut self, video_title: VideoTitle, _: &mut Context<Self>) -> Self::Result {
+        let mut job = self.jobs.take(&video_title.job).expect("The job can not be none");
+        let finished = job.finished;
+        job.title = Some(video_title.title);
+        self.jobs.insert(job);
+
+        if finished {
+            self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()));
+        } else {
+            self.broadcast(JobResponse::PendingJobs(self.pending_jobs()));
+        }
     }
 }
 
 #[derive(Message)]
 #[rtype(usize)]
 pub(crate) struct Connect {
-    pub(crate) addr: Recipient<JobAction>,
+    pub(crate) addr: Recipient<JobResponse>,
 }
 
 #[derive(Message)]
@@ -123,21 +249,24 @@ pub struct Disconnect {
 
 #[derive(Message)]
 #[rtype(result = "Result<Vec<Job>, std::io::Error>")]
-pub struct PendingJobs;
+pub enum JobQuery {
+    Pending,
+    Completed,
+}
 
+/// User facing messages
 #[derive(Debug, Message, Serialize, Clone)]
 #[rtype(result = "()")]
-pub(crate) enum JobAction {
-    Start(Job),
+pub(crate) enum JobResponse {
+    // Start(Job),
     Finished(Job),
-    /// job was already in queue
-    Rejected(Job),
     /// job finished, but unsuccessfully
     Failed {
         job: Job,
         reason: String,
     },
     PendingJobs(Vec<Job>),
+    CompletedJobs(Vec<Job>),
 }
 
 impl Actor for JobServer {
@@ -166,71 +295,51 @@ impl Handler<Disconnect> for JobServer {
     }
 }
 
-impl Handler<PendingJobs> for JobServer {
+impl Handler<JobQuery> for JobServer {
     type Result = Result<Vec<Job>, std::io::Error>;
 
-    fn handle(&mut self, _: PendingJobs, _: &mut Context<Self>) -> Self::Result {
-        Ok(self.pending_jobs())
+    fn handle(&mut self, query: JobQuery, _: &mut Context<Self>) -> Self::Result {
+        match query {
+            JobQuery::Pending => Ok(self.pending_jobs()),
+            JobQuery::Completed => Ok(self.finished_jobs()),
+        }
     }
 }
 
-impl Handler<JobAction> for JobServer {
+impl Handler<JobResponse> for JobServer {
     type Result = ();
 
-    fn handle(&mut self, msg: JobAction, _ctx: &mut Context<Self>) {
+    fn handle(&mut self, msg: JobResponse, _ctx: &mut Context<Self>) {
         info!("Request received: {:?}", msg);
         match msg.clone() {
-            JobAction::Start(job) => {
-                if self.jobs.insert(job.clone()) {
-                    self.broadcast(msg);
-                    self.start_job_actix(job, _ctx.address());
-                    self.broadcast(JobAction::PendingJobs(self.pending_jobs()));
-                } else {
-                    self.broadcast(JobAction::Rejected(job));
-                }
-            }
-            JobAction::Finished(job) | JobAction::Failed { job, reason: _ } => {
-                self.jobs.remove(&job);
+            JobResponse::Finished(job) | JobResponse::Failed { job, reason: _ } => {
+                self.mark_finished(&job);
                 self.broadcast(msg);
-                self.broadcast(JobAction::PendingJobs(self.pending_jobs()));
+                self.broadcast(JobResponse::PendingJobs(self.pending_jobs()));
+                self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()));
             }
             _ => (),
         }
     }
 }
 
-#[derive(Deserialize)]
-struct JobRequest {
-    url: String,
-    location: String,
-}
-
 #[post("/jobs")]
 async fn create_job(
     request: Json<JobRequest>,
     job_server: web::Data<actix::Addr<JobServer>>,
-) -> impl Responder {
-    let location = match Location::lookup(&request.location) {
-        Some(location) => location,
-        None => {
-            return HttpResponse::NotFound()
-                .json(format!("target location {} not found", &request.location))
-        }
-    };
+) -> Result<actix_web::HttpResponse, YodelError> {
+    let res = job_server.send(request.into_inner()).await?;
 
-    let job = Job::new(request.url.clone(), location);
-
-    info!("sending job request to job server");
-
-    job_server.send(JobAction::Start(job.clone())).await.ok();
-
-    HttpResponse::Accepted().json(job)
+    match res {
+        Ok(job) => Ok(HttpResponse::Accepted().json(job)),
+        Err(e) => Err(e),
+    }
 }
 
 #[get("/jobs")]
-async fn get_jobs(job_server: web::Data<actix::Addr<JobServer>>) -> impl Responder {
+async fn pending_jobs(job_server: web::Data<actix::Addr<JobServer>>) -> impl Responder {
     let jobs: Vec<Job> = job_server
-        .send(PendingJobs)
+        .send(JobQuery::Pending)
         .await
         .expect("Actix message error")
         .expect("This should never happen");
@@ -238,7 +347,11 @@ async fn get_jobs(job_server: web::Data<actix::Addr<JobServer>>) -> impl Respond
 }
 
 #[get("/completed-jobs")]
-async fn get_completed_jobs() -> impl Responder {
-    let jobs: Vec<Job> = Vec::new();
+async fn completed_jobs(job_server: web::Data<actix::Addr<JobServer>>) -> impl Responder {
+    let jobs: Vec<Job> = job_server
+        .send(JobQuery::Completed)
+        .await
+        .expect("Actix message error")
+        .expect("This should never happen");
     HttpResponse::Ok().json(jobs)
 }

@@ -74,11 +74,10 @@ impl Actor for WebsocketConnection {
 }
 
 /// Handle messages from server, we simply send it to peer websocket
-impl Handler<jobs::JobAction> for WebsocketConnection {
+impl Handler<jobs::JobResponse> for WebsocketConnection {
     type Result = ();
 
-    fn handle(&mut self, notification: jobs::JobAction, ctx: &mut Self::Context) {
-        debug!("about to send the client something");
+    fn handle(&mut self, notification: jobs::JobResponse, ctx: &mut Self::Context) {
         ctx.text(serde_json::to_string(&notification).unwrap_or_default());
     }
 }
