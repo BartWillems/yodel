@@ -32,7 +32,7 @@ async fn init() -> std::io::Result<()> {
             .wrap(Cors::permissive().supports_credentials())
             .service(
                 web::scope("/api")
-                    .service(config::get_config)
+                    .service(config::locations)
                     .service(jobs::pending_jobs)
                     .service(jobs::completed_jobs)
                     .service(jobs::create_job),

@@ -31,7 +31,7 @@ impl JobServer {
     }
 
     // Send a message to all connected clients
-    fn broadcast(&self, msg: JobResponse) {
+    fn broadcast(&self, msg: &JobResponse) {
         for session in self.sessions.values() {
             let _ = session.do_send(msg.clone());
         }
@@ -106,7 +106,7 @@ impl JobServer {
     fn pending_jobs(&self) -> Vec<Job> {
         self.jobs
             .iter()
-            .filter(|job: &&Job| !job.finished)
+            .filter(|job: &&Job| job.in_progress())
             .cloned()
             .collect()
     }
@@ -114,18 +114,23 @@ impl JobServer {
     fn finished_jobs(&self) -> Vec<Job> {
         self.jobs
             .iter()
-            .filter(|job: &&Job| job.finished)
+            .filter(|job: &&Job| job.is_completed())
             .cloned()
             .collect()
     }
 
-    // Mark a job as finished
-    fn mark_finished(&mut self, job: &Job) {
-        let mut job = self.jobs.take(job).expect("The job has to exist");
-        assert_eq!(job.finished, false);
-        job.finished = true;
-        self.jobs.insert(job);
+    /// Save an existing job with new values
+    /// panics if the job didn't exist yet
+    fn save(&mut self, job: Job) {
+        self.jobs.replace(job).expect("The job should already exist");
     }
+}
+
+#[derive(Eq, PartialEq, Debug, Clone, Serialize)]
+pub enum JobStatus {
+    Finished,
+    Failed(String),
+    InProgress,
 }
 
 #[derive(Debug, Clone, Serialize, Message)]
@@ -136,8 +141,45 @@ pub struct Job {
     title: Option<String>,
     location: Location,
     started_on: DateTime<Utc>,
-    finished: bool,
+    status: JobStatus,
 }
+
+impl Job {
+    fn in_progress(&self) -> bool {
+        self.status == JobStatus::InProgress
+    }
+
+    #[allow(dead_code)]
+    fn has_failed(&self) -> bool {
+        match self.status {
+            JobStatus::Failed(_) => true,
+            _ => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn has_succeeded(&self) -> bool {
+        self.status == JobStatus::Finished
+    }
+
+    /// return all completed jobs, failed or not
+    fn is_completed(&self) -> bool {
+        !self.in_progress()
+    }
+
+    fn set_finished(&mut self) {
+        self.status = JobStatus::Finished;
+    }
+
+    fn set_failed(&mut self, reason: String) {
+        self.status = JobStatus::Failed(reason);
+    }
+
+    fn set_title(&mut self, title: String) {
+        self.title = Some(title);
+    }
+}
+
 
 impl TryFrom<JobRequest> for Job {
     type Error = YodelError;
@@ -155,7 +197,7 @@ impl TryFrom<JobRequest> for Job {
             title: None,
             location,
             started_on: Utc::now(),
-            finished: false,
+            status: JobStatus::InProgress,
         })
     }
 }
@@ -203,7 +245,9 @@ impl Handler<JobRequest> for JobServer {
         if self.jobs.insert(job.clone()) {
             self.start_job(job.clone(), ctx.address());
             self.search_title(job.clone(), ctx.address());
-            self.broadcast(JobResponse::PendingJobs(self.pending_jobs()));
+            self.broadcast(
+                JobResponse::PendingJobs(self.pending_jobs()).as_ref()
+            );
             Ok(job)
         } else {
             Err(YodelError::Conflict(job.to_string()))
@@ -223,14 +267,14 @@ impl Handler<VideoTitle> for JobServer {
 
     fn handle(&mut self, video_title: VideoTitle, _: &mut Context<Self>) -> Self::Result {
         let mut job = self.jobs.take(&video_title.job).expect("The job can not be none");
-        let finished = job.finished;
-        job.title = Some(video_title.title);
+        let finished = job.is_completed();
+        job.set_title(video_title.title);
         self.jobs.insert(job);
 
         if finished {
-            self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()));
+            self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()).as_ref());
         } else {
-            self.broadcast(JobResponse::PendingJobs(self.pending_jobs()));
+            self.broadcast(JobResponse::PendingJobs(self.pending_jobs()).as_ref());
         }
     }
 }
@@ -267,6 +311,12 @@ pub(crate) enum JobResponse {
     },
     PendingJobs(Vec<Job>),
     CompletedJobs(Vec<Job>),
+}
+
+impl AsRef<JobResponse> for JobResponse {
+    fn as_ref(&self) -> &JobResponse {
+        &self
+    }
 }
 
 impl Actor for JobServer {
@@ -312,11 +362,19 @@ impl Handler<JobResponse> for JobServer {
     fn handle(&mut self, msg: JobResponse, _ctx: &mut Context<Self>) {
         info!("Request received: {:?}", msg);
         match msg.clone() {
-            JobResponse::Finished(job) | JobResponse::Failed { job, reason: _ } => {
-                self.mark_finished(&job);
-                self.broadcast(msg);
-                self.broadcast(JobResponse::PendingJobs(self.pending_jobs()));
-                self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()));
+            JobResponse::Finished(mut job) => {
+                job.set_finished();
+                self.save(job);
+                self.broadcast(&msg);
+                self.broadcast(JobResponse::PendingJobs(self.pending_jobs()).as_ref());
+                self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()).as_ref());
+            }
+            JobResponse::Failed {mut job, reason } => {
+                job.set_failed(reason);
+                self.save(job);
+                self.broadcast(&msg);
+                self.broadcast(JobResponse::PendingJobs(self.pending_jobs()).as_ref());
+                self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()).as_ref());
             }
             _ => (),
         }

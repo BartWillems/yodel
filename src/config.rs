@@ -13,8 +13,8 @@ lazy_static::lazy_static! {
     };
 }
 
-#[get("/config")]
-async fn get_config() -> impl Responder {
+#[get("/locations")]
+async fn locations() -> impl Responder {
     HttpResponse::Ok().json(LOCATIONS.clone())
 }
 
