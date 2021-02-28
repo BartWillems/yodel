@@ -4,12 +4,12 @@ use std::convert::From;
 
 #[derive(Debug, Display)]
 pub enum YodelError {
-    #[display(fmt = "Internal Server Error")]
     InternalServerError,
     #[display(fmt = "BadRequest: {}", _0)]
     BadRequest(String),
     #[display(fmt = "Job already exists: {}", _0)]
     Conflict(String),
+    TooManyJobs,
 }
 
 impl ResponseError for YodelError {
@@ -20,6 +20,9 @@ impl ResponseError for YodelError {
             }
             YodelError::BadRequest(ref message) => HttpResponse::BadRequest().json(message),
             YodelError::Conflict(ref message) => HttpResponse::Conflict().json(message),
+            YodelError::TooManyJobs => {
+                HttpResponse::TooManyRequests().json("Too many running jobs")
+            }
         }
     }
 }

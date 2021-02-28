@@ -19,6 +19,7 @@ pub(crate) struct JobServer {
     jobs: HashSet<Job>,
     sessions: HashMap<usize, Recipient<JobResponse>>,
     rng: ThreadRng,
+    job_limit: usize,
 }
 
 impl JobServer {
@@ -27,6 +28,7 @@ impl JobServer {
             jobs: HashSet::new(),
             sessions: HashMap::new(),
             rng: rand::thread_rng(),
+            job_limit: 16,
         }
     }
 
@@ -34,6 +36,26 @@ impl JobServer {
     fn broadcast(&self, msg: &JobResponse) {
         for session in self.sessions.values() {
             let _ = session.do_send(msg.clone());
+        }
+    }
+
+    /// Returns true if the server is running it's maximum allowed number of jobs
+    fn at_capacity(&self) -> bool {
+        let running_jobs = self.jobs.iter().filter(|&job| job.in_progress()).count();
+        running_jobs >= self.job_limit
+    }
+
+    /// Tries to add a job to the queue
+    /// Fails if the job was already added or the server is at capacity
+    fn add_job(&mut self, job: Job) -> Result<(), YodelError> {
+        if self.at_capacity() {
+            return Err(YodelError::TooManyJobs);
+        }
+
+        if self.jobs.insert(job.clone()) {
+            Ok(())
+        } else {
+            Err(YodelError::Conflict(job.to_string()))
         }
     }
 
@@ -77,29 +99,27 @@ impl JobServer {
     fn search_title(&mut self, job: Job, addr: Addr<JobServer>) {
         std::thread::spawn(move || {
             let res = Command::new("youtube-dl")
-            .arg("--get-title")
-            .arg(&job.url)
-            .output();
+                .arg("--get-title")
+                .arg(&job.url)
+                .output();
 
-        match res {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("job succeeded!");
-                            addr.do_send(VideoTitle {
-                        job,
-                        title: String::from_utf8_lossy(&output.stdout).to_string(),
-                    });
-                } else {
-                    let err = String::from_utf8_lossy(&output.stderr).to_string();
-                    error!("unable to fetch video title: {}", err);
+            match res {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("job succeeded!");
+                        addr.do_send(VideoTitle {
+                            job,
+                            title: String::from_utf8_lossy(&output.stdout).to_string(),
+                        });
+                    } else {
+                        let err = String::from_utf8_lossy(&output.stderr).to_string();
+                        error!("unable to fetch video title: {}", err);
+                    }
+                }
+                Err(reason) => {
+                    error!("video title lookup failure: {}", reason);
                 }
             }
-            Err(reason)=> {
-                error!("video title lookup failure: {}", reason);
-            }
-        }
-
-        
         });
     }
 
@@ -122,7 +142,9 @@ impl JobServer {
     /// Save an existing job with new values
     /// panics if the job didn't exist yet
     fn save(&mut self, job: Job) {
-        self.jobs.replace(job).expect("The job should already exist");
+        self.jobs
+            .replace(job)
+            .expect("The job should already exist");
     }
 }
 
@@ -179,7 +201,6 @@ impl Job {
         self.title = Some(title);
     }
 }
-
 
 impl TryFrom<JobRequest> for Job {
     type Error = YodelError;
@@ -242,16 +263,12 @@ impl Handler<JobRequest> for JobServer {
 
         let job = Job::try_from(request)?;
 
-        if self.jobs.insert(job.clone()) {
-            self.start_job(job.clone(), ctx.address());
-            self.search_title(job.clone(), ctx.address());
-            self.broadcast(
-                JobResponse::PendingJobs(self.pending_jobs()).as_ref()
-            );
-            Ok(job)
-        } else {
-            Err(YodelError::Conflict(job.to_string()))
-        }
+        self.add_job(job.clone())?;
+
+        self.start_job(job.clone(), ctx.address());
+        self.search_title(job.clone(), ctx.address());
+        self.broadcast(JobResponse::PendingJobs(self.pending_jobs()).as_ref());
+        Ok(job)
     }
 }
 
@@ -266,7 +283,10 @@ impl Handler<VideoTitle> for JobServer {
     type Result = ();
 
     fn handle(&mut self, video_title: VideoTitle, _: &mut Context<Self>) -> Self::Result {
-        let mut job = self.jobs.take(&video_title.job).expect("The job can not be none");
+        let mut job = self
+            .jobs
+            .take(&video_title.job)
+            .expect("The job can not be none");
         let finished = job.is_completed();
         job.set_title(video_title.title);
         self.jobs.insert(job);
@@ -369,7 +389,7 @@ impl Handler<JobResponse> for JobServer {
                 self.broadcast(JobResponse::PendingJobs(self.pending_jobs()).as_ref());
                 self.broadcast(JobResponse::CompletedJobs(self.finished_jobs()).as_ref());
             }
-            JobResponse::Failed {mut job, reason } => {
+            JobResponse::Failed { mut job, reason } => {
                 job.set_failed(reason);
                 self.save(job);
                 self.broadcast(&msg);
